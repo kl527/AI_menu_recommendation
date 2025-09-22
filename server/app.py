@@ -1,6 +1,4 @@
 import asyncio
-import serial
-import serial.tools.list_ports
 from hume import AsyncHumeClient
 from hume.expression_measurement.stream import Config
 from hume.expression_measurement.stream.socket_client import StreamConnectOptions
@@ -8,9 +6,34 @@ import cv2
 import base64
 import time
 import ssl
+from flask import Flask, jsonify
+from flask_cors import CORS
+import threading
 
 # Ensure we use a secure HTTPS context for all Hume API requests
 ssl._create_default_https_context = ssl.create_default_context
+
+# -------------------------------------------------------------------
+# Flask app setup for API communication
+# -------------------------------------------------------------------
+app = Flask(__name__)
+CORS(app, origins=['http://localhost:3000', 'http://localhost:3001'])  # Enable CORS for frontend communication
+
+# Global variable to store current emotion
+current_emotion = "Calm"
+emotion_lock = threading.Lock()
+
+@app.route('/api/emotion', methods=['GET'])
+def get_emotion():
+    """API endpoint to get current emotion"""
+    with emotion_lock:
+        return jsonify({"emotion": current_emotion})
+
+def update_emotion(emotion: str):
+    """Thread-safe function to update current emotion"""
+    global current_emotion
+    with emotion_lock:
+        current_emotion = emotion
 
 # -------------------------------------------------------------------
 # Define fine-grained emotion lists for mapping into broad categories
@@ -25,21 +48,18 @@ ANGER_EMOTIONS = [
     "Anger", "Contempt", "Disgust", "Envy", "Guilt"
 ]
 
-NEUTRAL_EMOTIONS = [
+CALM_EMOTIONS = [
     "Calmness", "Contentment", "Realization"
 ]
 
-SUPER_HAPPY_EMOTIONS = [
+HAPPY_EMOTIONS = [
     "Craving", "Determination", "Ecstasy", "Entrancement",
-    "Excitement", "Joy", "Pride", "Triumph"
-]
-
-SEMI_HAPPY_EMOTIONS = [
+    "Excitement", "Joy", "Pride", "Triumph",
     "Admiration", "Adoration", "Aesthetic Appreciation", "Amusement",
     "Love", "Nostalgia", "Relief", "Romance", "Satisfaction"
 ]
 
-FEAR_EMOTIONS = [
+STRESSED_EMOTIONS = [
     "Anxiety", "Awe", "Fear", "Horror"
 ]
 
@@ -56,73 +76,46 @@ def categorize_hume_emotion(emotion_label: str) -> str:
         return "Sadness"
     elif emotion_label in ANGER_EMOTIONS:
         return "Anger"
-    elif emotion_label in SUPER_HAPPY_EMOTIONS:
-        return "Super_Happy"
-    elif emotion_label in SEMI_HAPPY_EMOTIONS:
-        return "Semi_Happy"
-    elif emotion_label in FEAR_EMOTIONS:
-        return "Fear"
+    elif emotion_label in CALM_EMOTIONS:
+        return "Calm"
+    elif emotion_label in HAPPY_EMOTIONS:
+        return "Happy"
+    elif emotion_label in STRESSED_EMOTIONS:
+        return "Stressed"
     elif emotion_label in CURIOUS_EMOTIONS:
         return "Curious"
     else:
-        return "Neutral"
+        # Default to Calm to ensure only the six categories are produced
+        return "Calm"
 
 
-def send_message_to_arduino(emotion_category: str, face_position: str) -> bytes:
+def print_emotion_data(emotion_category: str, face_position: str, emotion_name: str, score: float):
     """
-    Send a formatted message to the Arduino over serial.
-    Returns the Arduino's raw response bytes, or None on error.
+    Print the detected emotion data in a structured format.
     """
-    try:
-        message = f"{emotion_category},{face_position}\n"
-        arduino_serial.write(message.encode('utf-8'))
-        time.sleep(0.05)  # small delay to allow Arduino to process
-        return arduino_serial.readline()
-    except Exception as err:
-        print(f"Error communicating with Arduino: {err}")
-        return None
-
-
-def connect_to_arduino(port: str = "",
-                       baudrate: int = 9600,
-                       timeout: float = 2.0) -> serial.Serial:
-    """
-    Establish a serial connection to the Arduino.
-    Raises serial.SerialException if connection fails.
-    """
-    ser = serial.Serial(port=port, baudrate=baudrate, timeout=timeout)
-    time.sleep(2)  # allow Arduino to reset after opening port
-    print(f"Connected to Arduino on {port}")
-    return ser
+    print(f"=== EMOTION DETECTION ===")
+    print(f"Emotion: {emotion_name}")
+    print(f"Category: {emotion_category}")
+    print(f"Score: {score:.3f}")
+    print(f"Face Position: {face_position}")
+    print(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
+    print("=" * 25)
 
 
 async def main():
     """
     Main async loop:
-      - Connect to Arduino
       - Initialize Hume streaming client
       - Open camera and detect face + emotion
-      - Relay events and emotion categories to Arduino
+      - Print emotion detection results
+      - Update emotion every 10 seconds
     """
-    global arduino_serial
     face_in_view_before = False
+    last_emotion_update = time.time()
+    EMOTION_UPDATE_INTERVAL = 10  # seconds
 
-    # Attempt to connect to Arduino, prompt if auto-detect fails
-    try:
-        print("Attempting to connect to Arduino...")
-        arduino_serial = connect_to_arduino()
-    except serial.SerialException as e:
-        print(f"Auto-connect failed: {e}")
-        manual_port = input("Enter Arduino port manually (e.g. COM4, /dev/ttyUSB0): ")
-        try:
-            arduino_serial = serial.Serial(port=manual_port, baudrate=9600, timeout=0.1)
-            print(f"Manually connected to Arduino on {manual_port}")
-        except Exception as e2:
-            print(f"Manual connect failed: {e2}")
-            return
-
-    # Add you arduino api_key
-    hume_client = AsyncHumeClient(api_key="your_own_api_key")
+    # Add your Hume API key
+    hume_client = AsyncHumeClient(api_key="your_hume_api_key")
     model_config = Config(face={})
     stream_options = StreamConnectOptions(config=model_config)
 
@@ -177,11 +170,9 @@ async def main():
                 # Detect user entry/exit events
                 faces_present_now = bool(result.face and result.face.predictions)
                 if faces_present_now and not face_in_view_before:
-                    print("User entered camera view")
-                    send_message_to_arduino("UserEntered", "Center")
+                    print("🎯 User entered camera view")
                 elif not faces_present_now and face_in_view_before:
-                    print("User left camera view")
-                    send_message_to_arduino("UserLeft", "")
+                    print("👋 User left camera view")
                 face_in_view_before = faces_present_now
 
                 # If a face is detected, compute position & emotion category
@@ -199,24 +190,32 @@ async def main():
                                 position_label = f"Right {offset_px} px"
                             else:
                                 position_label = "Center 0 px"
-                            print(f"[Hume] Face position: {position_label}")
                         else:
                             position_label = "Unknown"
 
                         # Choose the highest-scoring emotion and map to category
                         top_emotion = max(prediction.emotions, key=lambda e: e.score)
                         category = categorize_hume_emotion(top_emotion.name)
-                        print(f"Detected emotion: {top_emotion.name} -> {category} ({top_emotion.score:.2f})")
 
-                        # Only notify Arduino when category changes
+                        # Always print the currently detected emotion
+                        print(
+                            f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] Detected: {category} "
+                            f"(raw: {top_emotion.name} {top_emotion.score:.3f}) | Position: {position_label}"
+                        )
+
+                        # Only print when category changes to avoid spam
                         if category != previous_emotion_category:
-                            print(f"Emotion changed to: {category}")
-                        arduino_resp = send_message_to_arduino(category, position_label)
-                        if arduino_resp:
-                            print(f"Arduino replied: {arduino_resp.decode('utf-8').strip()}")
+                            print_emotion_data(category, position_label, top_emotion.name, top_emotion.score)
                         previous_emotion_category = category
 
-                # Throttle loop to avoid overloading serial/Hume
+                        # Update global emotion every 10 seconds
+                        current_time = time.time()
+                        if current_time - last_emotion_update >= EMOTION_UPDATE_INTERVAL:
+                            update_emotion(category)
+                            last_emotion_update = current_time
+                            print(f"🔄 Updated emotion to frontend: {category}")
+
+                # Throttle loop to avoid overloading Hume API
                 await asyncio.sleep(2)
 
             except Exception as proc_err:
@@ -224,10 +223,23 @@ async def main():
 
     # Clean up resources
     video_capture.release()
-    arduino_serial.close()
+
+
+def run_flask_server():
+    """Run Flask server in a separate thread"""
+    app.run(host='0.0.0.0', port=5001, debug=False, use_reloader=False)
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
-    # Add your arduino port
-    ARDUINO_DEFAULT_PORT = "/your/own/arduino_port"
+    print("Starting emotion detection system...")
+    print("Starting Flask API server on http://localhost:5001")
+    print("Press Ctrl+C to stop")
+    
+    # Start Flask server in a separate thread
+    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
+    flask_thread.start()
+    
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        print("\nEmotion detection stopped by user")
