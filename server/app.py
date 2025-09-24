@@ -6,7 +6,7 @@ import cv2
 import base64
 import time
 import ssl
-from flask import Flask, jsonify
+from flask import Flask, jsonify, request
 from flask_cors import CORS
 import threading
 
@@ -25,7 +25,7 @@ emotion_lock = threading.Lock()
 
 @app.route('/api/emotion', methods=['GET'])
 def get_emotion():
-    """API endpoint to get current emotion"""
+    """Legacy endpoint: returns last detected emotion (not used for new flow)"""
     with emotion_lock:
         return jsonify({"emotion": current_emotion})
 
@@ -73,33 +73,77 @@ def categorize_hume_emotion(emotion_label: str) -> str:
     Map a detailed Hume emotion name into one of our broad categories.
     """
     if emotion_label in SADNESS_EMOTIONS:
-        return "Sadness"
+        return "Sad😢"
     elif emotion_label in ANGER_EMOTIONS:
-        return "Anger"
+        return "Anger😡"
     elif emotion_label in CALM_EMOTIONS:
-        return "Calm"
+        return "Calm😌"
     elif emotion_label in HAPPY_EMOTIONS:
-        return "Happy"
+        return "Happy😊"
     elif emotion_label in STRESSED_EMOTIONS:
-        return "Stressed"
+        return "Stressed😫"
     elif emotion_label in CURIOUS_EMOTIONS:
-        return "Curious"
+        return "Curious😕"
     else:
         # Default to Calm to ensure only the six categories are produced
-        return "Calm"
+        return "Calm😌"
+
+
+async def analyze_base64_image(b64_image: str) -> str:
+    """
+    Analyze a single base64-encoded image using Hume streaming API
+    and return a broad emotion category string compatible with the frontend.
+    """
+    hume_client = AsyncHumeClient(api_key="jXvKPYTvVWO3XqqzGgi6WjoSmstGguywD3Mtvekscq67YU1R")
+    model_config = Config(face={})
+    stream_options = StreamConnectOptions(config=model_config)
+
+    async with hume_client.expression_measurement.stream.connect(options=stream_options) as hume_stream:
+        result = await hume_stream.send_file(b64_image)
+        if not result.face or not result.face.predictions:
+            return "Calm"
+
+        # Pick the highest-scoring emotion across first face
+        prediction = result.face.predictions[0]
+        top_emotion = max(prediction.emotions, key=lambda e: e.score)
+        category = categorize_hume_emotion(top_emotion.name)
+        return category
+
+
+@app.route('/api/analyze', methods=['POST'])
+def analyze():
+    """Accept a captured data URL image and return a single categorized emotion."""
+    try:
+        payload = request.get_json(silent=True) or {}
+        data_url = payload.get('image', '')
+        if not isinstance(data_url, str) or not data_url:
+            return jsonify({"error": "Missing image"}), 400
+
+        # Expect a data URL like: data:image/jpeg;base64,XXXXX
+        if "," in data_url:
+            b64_part = data_url.split(",", 1)[1]
+        else:
+            b64_part = data_url
+
+        # Run analysis once
+        emotion = asyncio.run(analyze_base64_image(b64_part))
+
+        # Update global for legacy GET users (optional)
+        update_emotion(emotion)
+
+        return jsonify({"emotion": emotion})
+    except Exception as e:
+        print(f"/api/analyze error: {e}")
+        return jsonify({"error": "Failed to analyze image"}), 500
 
 
 def print_emotion_data(emotion_category: str, face_position: str, emotion_name: str, score: float):
     """
     Print the detected emotion data in a structured format.
     """
-    print(f"=== EMOTION DETECTION ===")
     print(f"Emotion: {emotion_name}")
     print(f"Category: {emotion_category}")
     print(f"Score: {score:.3f}")
-    print(f"Face Position: {face_position}")
-    print(f"Timestamp: {time.strftime('%Y-%m-%d %H:%M:%S')}")
-    print("=" * 25)
 
 
 async def main():
@@ -112,10 +156,10 @@ async def main():
     """
     face_in_view_before = False
     last_emotion_update = time.time()
-    EMOTION_UPDATE_INTERVAL = 10  # seconds
+    EMOTION_UPDATE_INTERVAL = 5  # seconds
 
     # Add your Hume API key
-    hume_client = AsyncHumeClient(api_key="your_hume_api_key")
+    hume_client = AsyncHumeClient(api_key="jXvKPYTvVWO3XqqzGgi6WjoSmstGguywD3Mtvekscq67YU1R")
     model_config = Config(face={})
     stream_options = StreamConnectOptions(config=model_config)
 
@@ -231,15 +275,6 @@ def run_flask_server():
 
 
 if __name__ == "__main__":
-    print("Starting emotion detection system...")
     print("Starting Flask API server on http://localhost:5001")
     print("Press Ctrl+C to stop")
-    
-    # Start Flask server in a separate thread
-    flask_thread = threading.Thread(target=run_flask_server, daemon=True)
-    flask_thread.start()
-    
-    try:
-        asyncio.run(main())
-    except KeyboardInterrupt:
-        print("\nEmotion detection stopped by user")
+    run_flask_server()
